@@ -348,7 +348,14 @@ where
             // FT: <https://gitlab.freedesktop.org/freetype/freetype/-/blob/80a507a6b8e3d2906ad2c8ba69329bd2fb2a85ef/src/psaux/psintrp.c#L2463>
             EndChar => {
                 let stack_len = self.stack.len();
-                if (stack_len == 1 || stack_len == 5) && !self.seen_width_command {
+                // A stack depth of 1 means a standalone width argument.
+                // A stack depth >= 5 indicates the deprecated seac-via-endchar
+                // form, where the first (bottom) stack element is an optional
+                // width argument. The seac args are the remaining 4 (modern
+                // CFF: adx ady bchar achar) or 5 (legacy with asb:
+                // asb adx ady bchar achar) elements.
+                // See Appendix C at <https://adobe-type-tools.github.io/font-tech-notes/pdfs/5177.Type2.pdf#page=35>
+                if (stack_len == 1 || stack_len >= 5) && !self.seen_width_command {
                     self.read_width()?;
                 }
                 self.seen_width_command = true;
@@ -757,6 +764,7 @@ where
         } else if !self.stack.is_empty() && !self.seen_width_command {
             self.wx = self.stack.pop_fixed()?;
             self.seen_width_command = true;
+            self.have_read_width = true;
             Fixed::ZERO
         } else {
             Fixed::ZERO
@@ -2216,5 +2224,121 @@ mod tests {
         fn weight_vector(&self) -> &[Fixed] {
             &self.0
         }
+    }
+
+    /// A context that provides fixed base and accent charstrings for seac tests.
+    struct SeacContext {
+        base_charstring: &'static [u8],
+        accent_charstring: &'static [u8],
+    }
+
+    impl CharstringContext for SeacContext {
+        fn kind(&self) -> CharstringKind {
+            CharstringKind::Type2
+        }
+
+        fn seac_components(
+            &self,
+            _base_code: i32,
+            _accent_code: i32,
+        ) -> Result<[&[u8]; 2], Error> {
+            Ok([self.base_charstring, self.accent_charstring])
+        }
+
+        fn global_subr(&self, _index: i32) -> Result<&[u8], Error> {
+            Err(Error::MissingSubroutines)
+        }
+
+        fn subr(&self, _index: i32) -> Result<&[u8], Error> {
+            Err(Error::MissingSubroutines)
+        }
+    }
+
+    /// Charstring encoding helpers used for seac tests.
+    fn encode_cff_int(val: i32) -> Vec<u8> {
+        if (-107..=107).contains(&val) {
+            vec![(val + 139) as u8]
+        } else if (108..=1131).contains(&val) {
+            let v = val - 108;
+            vec![((v >> 8) + 247) as u8, (v & 0xff) as u8]
+        } else if (-1131..=-108).contains(&val) {
+            let v = -val - 108;
+            vec![((v >> 8) + 251) as u8, (v & 0xff) as u8]
+        } else {
+            // short int (28 prefix)
+            vec![28, ((val >> 8) & 0xff) as u8, (val & 0xff) as u8]
+        }
+    }
+
+    fn build_seac_charstring(args: &[i32]) -> Vec<u8> {
+        let mut cs = Vec::new();
+        for &arg in args {
+            cs.extend(encode_cff_int(arg));
+        }
+        cs.push(14); // endchar
+        cs
+    }
+
+    /// Minimal base/accent charstring: just an endchar.
+    const EMPTY_CHARSTRING: &[u8] = &[14];
+
+    /// seac-via-endchar with 4 args (adx ady bchar achar): no width supplied.
+    ///
+    /// The spec-compliant form without an explicit width; the caller should use
+    /// `defaultWidthX`.  Returns `None`.
+    #[test]
+    fn seac_endchar_4arg_no_width() {
+        // adx=157, ady=0, bchar=97, achar=200
+        let cs = build_seac_charstring(&[157, 0, 97, 200]);
+        let ctx = SeacContext {
+            base_charstring: EMPTY_CHARSTRING,
+            accent_charstring: EMPTY_CHARSTRING,
+        };
+        let mut commands = CaptureCommandSink::default();
+        let width = evaluate(&ctx, None, &cs, &mut commands).unwrap();
+        // No width in charstring → caller should apply defaultWidthX
+        assert_eq!(width, None);
+    }
+
+    /// seac-via-endchar with 5 args (w adx ady bchar achar): width is the first
+    /// (bottom-of-stack) value, without the deprecated `asb` argument.
+    ///
+    /// This is the common form used by real CFF fonts converted from Type 1.
+    /// The width delta is 96, so the caller adds `nominalWidthX` (587) →
+    /// advance = 683.  Skrifa must return `Some(96)`.
+    ///
+    /// Regression test for <https://github.com/googlefonts/fontations/issues/new>
+    /// ("CFF seac-via-endchar: width argument ignored, defaultWidthX used").
+    #[test]
+    fn seac_endchar_5arg_with_width() {
+        // width=96, adx=157, ady=0, bchar=97, achar=200
+        let cs = build_seac_charstring(&[96, 157, 0, 97, 200]);
+        let ctx = SeacContext {
+            base_charstring: EMPTY_CHARSTRING,
+            accent_charstring: EMPTY_CHARSTRING,
+        };
+        let mut commands = CaptureCommandSink::default();
+        let width = evaluate(&ctx, None, &cs, &mut commands).unwrap();
+        // Width delta 96 is present; nominal_width (587) will be added by the
+        // caller to yield the final advance of 683.
+        assert_eq!(width, Some(Fixed::from_i32(96)));
+    }
+
+    /// seac-via-endchar with 6 args (w asb adx ady bchar achar): width is the
+    /// first (bottom-of-stack) value; `asb` is ignored as per the CFF spec.
+    ///
+    /// This is the legacy form that includes the deprecated `asb` argument.
+    #[test]
+    fn seac_endchar_6arg_with_width_and_asb() {
+        // width=96, asb=0, adx=157, ady=0, bchar=97, achar=200
+        let cs = build_seac_charstring(&[96, 0, 157, 0, 97, 200]);
+        let ctx = SeacContext {
+            base_charstring: EMPTY_CHARSTRING,
+            accent_charstring: EMPTY_CHARSTRING,
+        };
+        let mut commands = CaptureCommandSink::default();
+        let width = evaluate(&ctx, None, &cs, &mut commands).unwrap();
+        // Width delta 96 is present; asb=0 is ignored.
+        assert_eq!(width, Some(Fixed::from_i32(96)));
     }
 }
